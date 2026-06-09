@@ -10,3 +10,4 @@
   2. 将chatvveai的导出格式转为Open WebUI的导入格式
   3. excel多文件拆分合并
   4. 扫描文件树
+  5. jp2转png
