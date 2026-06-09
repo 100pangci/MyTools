@@ -6,4 +6,6 @@
   1. 图种生成 - 来源不详
   2. 删除🍐👁红的🐴 - 用来删掉（）网盘的智能看图。感谢：`https://xzonn.top/posts/Remove-Intelligent-Image-Viewer.html`
 - Python
-  1. 图片批量等比例缩小 - 需`pip install Pillow`
+  1. 图片批量等比例缩小
+  2. 将chatvveai的导出格式转为Open WebUI的导入格式
+  3. excel多文件拆分合并
