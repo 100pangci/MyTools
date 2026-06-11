@@ -14,3 +14,4 @@
   6. Firefox书签转Tree，使用方法见：`https://github.com/100pangci/My-Firefox-Bookmark-Tree`
 - JS
   1. 飞牛OS路径穿越文件链接补全
+  2. 内存替换运行内存
