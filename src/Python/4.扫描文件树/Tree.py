@@ -27,6 +27,17 @@ IGNORE_DIRS = {
 
 # ================= 核心逻辑 =================
 
+def normalize_display_path(path):
+    """统一给用户展示的路径分隔符，去掉目录尾部分隔符（根路径除外）"""
+    normalized = path.replace('\\', '/')
+    if normalized.endswith(':'):
+        normalized += '/'
+    if len(normalized) > 1:
+        normalized = normalized.rstrip('/')
+        if normalized.endswith(':'):
+            normalized += '/'
+    return normalized
+
 def get_drives_to_scan():
     """获取除C盘系统根目录外的所有磁盘（支持文件夹挂载点）"""
     drives = []
@@ -51,7 +62,7 @@ def get_drives_to_scan():
 
             # 只有通过检查的才加入列表
             drives.append(mount_point)
-            print(f"  + 已找到待扫描磁盘: {mount_point}")
+            print(f"  + 已找到待扫描磁盘: {normalize_display_path(mount_point)}")
                 
     except Exception as e:
         print(f"获取磁盘列表时出错: {e}")
@@ -73,17 +84,17 @@ def generate_tree(directory, prefix='', level=0):
         # os.scandir 是性能优化的关键
         with os.scandir(directory) as it:
             # 过滤并排序：先按文件名排序确保输出稳定
-            entries = sorted(
-                [e for e in it if e.name.lower() not in IGNORE_DIRS],
-                key=lambda e: e.name.lower()
-            )
-            
+            all_entries = [e for e in it if e.name.lower() not in IGNORE_DIRS]
+            dirs = sorted([e for e in all_entries if e.is_dir(follow_symlinks=False)], key=lambda e: e.name.lower())
+            files = sorted([e for e in all_entries if not e.is_dir(follow_symlinks=False)], key=lambda e: e.name.lower())
+            entries = dirs + files
+
             count = len(entries)
             for i, entry in enumerate(entries):
                 is_last = (i == count - 1)
                 pointer = '└── ' if is_last else '├── '
-                
-                print(f"{prefix}{pointer}{entry.name}")
+                display_name = entry.name + '/' if entry.is_dir(follow_symlinks=False) else entry.name
+                print(f"{prefix}{pointer}{display_name}")
                 
                 # entry.is_dir() 利用了缓存的元数据，无需再次请求操作系统
                 if entry.is_dir(follow_symlinks=False):
@@ -103,8 +114,9 @@ def run_scan_and_print(drives):
         if i > 0:
             print("\n" + "=" * 50 + "\n") 
         
-        print(f"磁盘/挂载点: {drive_path}\n")
-        print(drive_path)
+        display_drive_path = normalize_display_path(drive_path)
+        print(f"磁盘/挂载点: {display_drive_path}\n")
+        print(display_drive_path)
         # 从 Level 0 开始递归
         generate_tree(drive_path, level=0)
 
@@ -152,7 +164,7 @@ def main():
                 print(f" 文件树扫描报告")
                 # 时间戳保留在这里，打开文件依然能看到是什么时候扫的
                 print(f" 扫描时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                print(f" 扫描位置: {', '.join(drives_to_scan)}")
+                print(f" 扫描位置: {', '.join(normalize_display_path(path) for path in drives_to_scan)}")
                 print(f" 深度限制: {LEVEL_LIMIT} 层")
                 print("=" * 50 + "\n")
                 
