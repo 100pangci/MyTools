@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         内存替换运行内存
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.0.1
 // @description  将网页界面中的“运行内存”自动替换为“内存”。
 // @author       100pangci
 // @match        *://*/*
@@ -12,16 +12,31 @@
 (function () {
     'use strict';
 
-    const SOURCE_TEXT = '运行内存';
     const TARGET_TEXT = '内存';
+    const REPLACEMENTS = [
+        ['运行内存', TARGET_TEXT],
+        ['运存', TARGET_TEXT]
+    ];
     const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA', 'INPUT']);
 
     function replaceInTextNode(node) {
-        if (!node || !node.nodeValue || !node.nodeValue.includes(SOURCE_TEXT)) {
+        if (!node || !node.nodeValue) {
             return;
         }
 
-        node.nodeValue = node.nodeValue.split(SOURCE_TEXT).join(TARGET_TEXT);
+        let text = node.nodeValue;
+        let changed = false;
+
+        for (const [sourceText, targetText] of REPLACEMENTS) {
+            if (text.includes(sourceText)) {
+                text = text.split(sourceText).join(targetText);
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            node.nodeValue = text;
+        }
     }
 
     function walkAndReplace(root) {
@@ -36,7 +51,11 @@
                     return NodeFilter.FILTER_REJECT;
                 }
 
-                return node.nodeValue && node.nodeValue.includes(SOURCE_TEXT)
+                if (!node.nodeValue) {
+                    return NodeFilter.FILTER_SKIP;
+                }
+
+                return REPLACEMENTS.some(([sourceText]) => node.nodeValue.includes(sourceText))
                     ? NodeFilter.FILTER_ACCEPT
                     : NodeFilter.FILTER_SKIP;
             }
