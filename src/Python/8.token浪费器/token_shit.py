@@ -108,7 +108,8 @@ class TokenBurner:
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=self.max_tokens,
                     temperature=self.temperature,
-                    timeout=120  # 设置超时时间
+                    timeout=120,  # 设置超时时间
+                    extra_body={"enable_thinking": False}  # 阿里云 DashScope API 需要设置此参数
                 )
                 
                 tokens_used = response.usage.total_tokens
