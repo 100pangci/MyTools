@@ -81,7 +81,7 @@ class TokenBurner:
         model: str,
         max_tokens: int = 4000,
         temperature: float = 0.9,
-        concurrency: int = 5
+        concurrency: int = 8
     ):
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.model = model
