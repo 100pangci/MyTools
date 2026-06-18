@@ -22,6 +22,7 @@
         ```bash
         python token_shit.py -k "your-api-key" -m "qwen-turbo"
         python token_shit.py -k "your-api-key" -m "qwen-turbo" -c 10 --max-tokens 8000
+        python token_shit.py -k "your-api-key" -u "https://api.example.com" -m "gpt-4"
         ```
 - JS
   1. 飞牛OS路径穿越文件链接补全
