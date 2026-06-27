@@ -15,15 +15,15 @@
 
 ────────────────────────────────────────────────────────────────
 【模式二：无限重复模式】（加 -s 或 --self-dialogue 开启）
-  AI 先出一道超长难题并自己回答（初始对话），然后进入无限循环：
-  每轮将"全部对话历史"重复 N 遍（N 由 -r 指定），作为超长 prompt
+  AI 先出一道超长难题并自己回答（初始对话），然后进入循环：
+  每轮将"全部对话历史"重复 N 遍（N 由 -rp 指定），作为超长 prompt
   发给 API，拿到回复后追加到历史中，下一轮继续重复（prompt 越来
-  越长），无限跑下去直到你按 Ctrl+C 停止。
+  越长），每跑满 -r 轮后自动清空对话历史并重新开始，持续循环。
   用于：
   • 让 prompt 用量爆炸式增长
   • 测试模型对超长上下文的处理能力
   • 在最短时间内消耗最多 Token
-  参数：-r 控制重复倍数，-c 控制并发 Worker 数
+  参数：-r 控制每批次轮次上限，-rp 控制重复倍数，-c 控制并发 Worker 数
 
 ────────────────────────────────────────────────────────────────
 快速切换：默认是模式一，加参数 --self-dialogue（或 -s）切换到模式二。
@@ -245,10 +245,10 @@ class DialogueStats:
     def add_error(self):
         self.error_count += 1
 
-    def add_round_usage(self, question_usage: int, answer_usage: int):
-        self.question_tokens += question_usage
-        self.answer_tokens += answer_usage
-        round_total = question_usage + answer_usage
+    def add_round_usage(self, prompt_tokens: int, completion_tokens: int):
+        self.total_prompt_tokens += prompt_tokens
+        self.total_completion_tokens += completion_tokens
+        round_total = prompt_tokens + completion_tokens
         self.total_tokens += round_total
         self.round_tokens.append(round_total)
 
@@ -291,6 +291,7 @@ class SelfDialogueBurner:
         max_tokens: int = 4096,
         temperature: float = 0.95,
         rounds: int = 10,
+        repeat_count: int = 3,
         enable_thinking: bool = False,
         concurrency: int = 1,
     ):
@@ -298,8 +299,8 @@ class SelfDialogueBurner:
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
-        self.rounds = rounds
-        self.repeat_count = rounds  # -r 的值：每次把对话历史重复的遍数
+        self.rounds = rounds          # -r：每批次运行的对话轮次上限
+        self.repeat_count = repeat_count  # 每次把对话历史重复的遍数
         self.enable_thinking = enable_thinking
         self.concurrency = concurrency
         self._shutdown_event = asyncio.Event()
@@ -430,86 +431,105 @@ class SelfDialogueBurner:
         return content, prompt_tokens, completion_tokens
 
     async def _run_worker(self, worker_id: int) -> DialogueStats:
-        """单个 worker 的无限重复循环（独立的消息历史和统计）"""
-        msgs = [{"role": "system", "content": self.SYSTEM_PROMPT}]
+        """单个 worker 的重复循环（独立的消息历史和统计），每批次跑 self.rounds 轮后自动清空并继续"""
         stats = DialogueStats()
         stats.reset()
 
-        logger.info(f"🧵 Worker [{worker_id}] 启动")
+        logger.info(f"🧵 Worker [{worker_id}] 启动 | 每批次 {self.rounds} 轮后自动清空")
+
+        batch_no = 0
+        total_batch_tokens = 0
 
         try:
-            # ── 初始 Q&A 生成（逐步记录消耗，确保中途中断也能保留部分 token） ──
-            logger.info(f"🧵 Worker [{worker_id}] 初始对话生成")
-            try:
-                q_content, q_prompt, q_completion = await self._question_phase(1, msgs)
-                # 出题消耗立即记录，不等答题完成
-                stats.total_tokens += q_prompt + q_completion
-                stats.total_prompt_tokens += q_prompt
-                stats.question_tokens += q_prompt + q_completion
-
-                a_content, a_prompt, a_completion = await self._answer_phase(1, msgs)
-                # 答题消耗立即记录
-                stats.total_tokens += a_prompt + a_completion
-                stats.total_completion_tokens += a_completion
-                stats.answer_tokens += a_prompt + a_completion
-
-                logger.info(f"🧵 Worker [{worker_id}] 初始对话完成 | "
-                            f"消耗: {q_prompt+q_completion+a_prompt+a_completion:,} tokens")
-            except asyncio.CancelledError:
-                logger.info(f"⚠️ Worker [{worker_id}] 初始对话被取消，已记录部分 token 消耗")
-                return stats  # 返回已有统计数据，不丢失已消耗的 token
-            except Exception as e:
-                logger.error(f"❌ Worker [{worker_id}] 初始对话失败，已跳过: {type(e).__name__}: {e}")
-                stats.add_error()
-                # 初始对话失败后直接进入循环尝试，利用已有消息继续
-
-            # ── 无限循环 ──
-            loop_round = 1
             while not self._shutdown_event.is_set():
-                non_system_msgs = [m for m in msgs if m["role"] != "system"]
-                repeated_msgs = non_system_msgs * self.repeat_count
+                batch_no += 1
+                # ── 每个批次重新初始化对话历史 ──
+                msgs = [{"role": "system", "content": self.SYSTEM_PROMPT}]
+                batch_round = 0
 
-                trigger_msg = {
-                    "role": "user",
-                    "content": (
-                        "请基于以上所有内容，继续深入扩展论述，加入新的维度和思考，"
-                        "回答越长越好，不要重复已有的内容。"
-                    )
-                }
+                logger.info(f"🧵 Worker [{worker_id}] ── 第 {batch_no} 批次启动 ──")
 
-                full_messages = [msgs[0]] + repeated_msgs + [trigger_msg]
-                prompt_msg_count = len(full_messages)
-
-                logger.info(f"🧵 Worker [{worker_id}] 第{loop_round}轮重复 | "
-                            f"发送 {prompt_msg_count} 条消息（{self.repeat_count} 遍×{len(non_system_msgs)} 条历史）")
-
+                # ── 初始 Q&A 生成（逐步记录消耗，确保中途中断也能保留部分 token） ──
+                logger.info(f"🧵 Worker [{worker_id}] 批次{batch_no}·初始对话")
                 try:
-                    content, prompt_tokens, completion_tokens = await self._call_llm(
-                        f"Worker[{worker_id}]第{loop_round}轮", full_messages
-                    )
-                    total_used = prompt_tokens + completion_tokens
+                    q_content, q_prompt, q_completion = await self._question_phase(1, msgs)
+                    stats.total_tokens += q_prompt + q_completion
+                    stats.total_prompt_tokens += q_prompt
+                    stats.question_tokens += q_prompt + q_completion
 
-                    msgs.append(trigger_msg)
-                    msgs.append({"role": "assistant", "content": content})
+                    a_content, a_prompt, a_completion = await self._answer_phase(1, msgs)
+                    stats.total_tokens += a_prompt + a_completion
+                    stats.total_completion_tokens += a_completion
+                    stats.answer_tokens += a_prompt + a_completion
+                    batch_round += 1  # 初始 Q&A 算 1 轮
 
-                    stats.add_round_usage(prompt_tokens, completion_tokens)
-                    stats.total_prompt_tokens += prompt_tokens
-                    stats.total_completion_tokens += completion_tokens
-
-                    logger.info(f"🧵 Worker [{worker_id}] 第{loop_round}轮完成 | "
-                                f"消耗: {total_used:,} | 累计: {stats.total_tokens:,} tokens")
-
+                    logger.info(f"🧵 Worker [{worker_id}] 批次{batch_no}·初始对话完成 | "
+                                f"消耗: {q_prompt+q_completion+a_prompt+a_completion:,} tokens")
                 except asyncio.CancelledError:
-                    raise
+                    logger.info(f"⚠️ Worker [{worker_id}] 批次{batch_no}·初始对话被取消")
+                    return stats
                 except Exception as e:
-                    logger.error(f"❌ Worker [{worker_id}] 第{loop_round}轮失败: {type(e).__name__}: {e}")
+                    logger.error(f"❌ Worker [{worker_id}] 批次{batch_no}·初始对话失败，跳过: {type(e).__name__}: {e}")
                     stats.add_error()
 
-                loop_round += 1
+                # ── 循环跑满 self.rounds 轮（减去已完成的那一轮） ──
+                while batch_round < self.rounds and not self._shutdown_event.is_set():
+                    non_system_msgs = [m for m in msgs if m["role"] != "system"]
+
+                    # 如果没有足够的历史消息（应该不会），直接跳过复重复
+                    if not non_system_msgs:
+                        logger.warning(f"⚠️ Worker [{worker_id}] 批次{batch_no}·无可重复消息，跳过")
+                        break
+
+                    repeated_msgs = non_system_msgs * self.repeat_count
+
+                    trigger_msg = {
+                        "role": "user",
+                        "content": (
+                            "请基于以上所有内容，继续深入扩展论述，加入新的维度和思考，"
+                            "回答越长越好，不要重复已有的内容。"
+                        )
+                    }
+
+                    full_messages = [msgs[0]] + repeated_msgs + [trigger_msg]
+                    prompt_msg_count = len(full_messages)
+
+                    logger.info(f"🧵 Worker [{worker_id}] 批次{batch_no}·第{batch_round+1}轮 | "
+                                f"发送 {prompt_msg_count} 条消息（{self.repeat_count} 遍×{len(non_system_msgs)} 条历史）")
+
+                    try:
+                        content, prompt_tokens, completion_tokens = await self._call_llm(
+                            f"W[{worker_id}]批次{batch_no}第{batch_round+1}轮", full_messages
+                        )
+                        total_used = prompt_tokens + completion_tokens
+
+                        msgs.append(trigger_msg)
+                        msgs.append({"role": "assistant", "content": content})
+
+                        stats.add_round_usage(prompt_tokens, completion_tokens)
+                        batch_round += 1
+
+                        logger.info(f"🧵 Worker [{worker_id}] 批次{batch_no}·第{batch_round}轮完成 | "
+                                    f"消耗: {total_used:,} | 批次累计: {sum(stats.round_tokens[-batch_round:]):,} tokens")
+
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.error(f"❌ Worker [{worker_id}] 批次{batch_no}·第{batch_round+1}轮失败: {type(e).__name__}: {e}")
+                        stats.add_error()
+                        await asyncio.sleep(1)
+
+                # ── 批次完成，自动清空 ──
+                batch_tokens = sum(stats.round_tokens[-batch_round:]) if stats.round_tokens else 0
+                total_batch_tokens += batch_tokens
+                logger.info(f"🧵 Worker [{worker_id}] ✅ 批次 {batch_no} 完成 "
+                            f"({batch_round} 轮, 约 {batch_tokens:,} tokens) — "
+                            f"已自动清空，准备下一批次...")
+                await asyncio.sleep(0.5)  # 短暂停顿，避免狂刷
 
         except asyncio.CancelledError:
-            logger.info(f"⚠️ Worker [{worker_id}] 无限循环被取消，已记录 {stats.total_tokens:,} tokens")
-            return stats  # 保留无限循环期间已消耗的 token 统计
+            logger.info(f"⚠️ Worker [{worker_id}] 被取消，已记录 {stats.total_tokens:,} tokens")
+            return stats
 
         return stats
 
@@ -625,25 +645,56 @@ class SelfDialogueBurner:
 
 def parse_args():
     """解析命令行参数"""
-    parser = argparse.ArgumentParser(
-        description='🔥 Token 浪费器 — 消耗 AI API Token 的工具（支持并发压测 / 无限重复双模式）',
+    class _ChineseFriendlyParser(argparse.ArgumentParser):
+        """缺失必填参数时用中文提示 + 示例"""
+
+        def error(self, message):
+            self.print_usage(sys.stderr)
+            msg = f"\n❌ 参数错误：{message}\n"
+            if 'api-key' in message or '-k' in message:
+                msg += "   💡 必须提供 API 密钥（--api-key / -k），没有密钥无法调用任何 AI 模型！\n"
+            if 'model' in message or '-m' in message:
+                msg += "   💡 必须指定模型名称（--model / -m），例如 qwen-turbo、gpt-4o 等\n"
+            msg += (
+                "\n📖 快速上手：\n"
+                "   python token_shit.py -k sk-xxxxxx -m qwen-turbo         ← 模式一：并发压测\n"
+                "   python token_shit.py -k sk-xxxxxx -m qwen-turbo -s      ← 模式二：无限重复\n"
+                "   python token_shit.py --help                             ← 完整中文说明\n"
+            )
+            self.exit(2, msg)
+
+    parser = _ChineseFriendlyParser(
+        description='🔥 Token 浪费器 — 疯狂消耗 AI API Token 的工具\n'
+                    '\n'
+                    '【双模式设计】\n'
+                    '  模式一：并发压测模式（默认，不加 -s）\n'
+                    '    多线程并发发送垃圾 Prompt，疯狂消耗 Token，适合压测 API 并发能力\n'
+                    '  模式二：无限重复模式（加 -s 开启）\n'
+                    '    AI 先出题+自答，然后每轮把历史重复多遍塞给 API，跑满 -r 轮后自动清空\n'
+                    '    让 Prompt 和 Token 用量爆炸式增长\n',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-使用示例（配合 --help 查看所有参数说明）：
+📋 使用示例：
 
-  ── 模式一：并发压测（默认）─────────────────────────────────
+  ── 模式一：并发压测（默认，不加 -s）─────────────────────────────────
     python token_shit.py -k "你的API密钥" -m "qwen-turbo"
-        ← 基础用法：5 个并发请求压测
+        ← 基础用法：5 个并发请求，疯狂发垃圾 Prompt 消耗 Token
 
     python token_shit.py -k "你的API密钥" -m "gpt-4o" -c 10 --max-tokens 8000
-        ← 10 个并发，每次最多输出 8000 tokens
+        ← 10 个并发同时轰炸，每次最多输出 8000 tokens，压榨 API
+
+    python token_shit.py -k "你的API密钥" -m "deepseek-chat" --no-thinking
+        ← 关闭思考链（某些模型默认会输出思考过程，加上可以省一点 Token）
 
   ── 模式二：无限重复（加 -s）────────────────────────────────
     python token_shit.py -k "你的API密钥" -m "qwen-turbo" -s
-        ← 先出题+答题，之后每轮将历史重复 10 遍发送，无限循环直到 Ctrl+C
+        ← AI 先出题+自答，之后每轮把历史重复 3 遍，每跑 10 轮自动清空重新开始
 
-    python token_shit.py -k "你的API密钥" -m "deepseek-chat" -s -r 20 --max-tokens 8192
-        ← 每轮将历史重复 20 遍，prompt 越来越长，无限跑下去
+    python token_shit.py -k "你的API密钥" -m "deepseek-chat" -s -r 20 -rp 5 --max-tokens 8192
+        ← 每批次跑 20 轮对话，每轮重复历史 5 遍，prompt 越来越长，跑满自动清空
+
+    python token_shit.py -k "你的API密钥" -m "qwen-turbo" -s -c 3
+        ← 3 个 Worker 同时跑无限重复，消耗速度翻 3 倍
         """
     )
 
@@ -678,13 +729,19 @@ def parse_args():
     parser.add_argument(
         '--self-dialogue', '-s',
         action='store_true',
-        help='【切换模式】启用无限重复模式（不传此参数则使用并发压测模式；传了则 AI 先出题+答题，之后每轮将全部对话历史重复 -r 遍后发送给 API，无限循环直到 Ctrl+C）'
+        help='【切换模式】启用无限重复模式（不传此参数则使用并发压测模式；传了则 AI 先出题+答题，之后每轮将全部对话历史重复 -rp 遍后发给 API，每 -r 轮后自动清空重新开始）'
     )
     parser.add_argument(
         '--rounds', '-r',
         type=int,
         default=10,
-        help='【无限重复模式】每轮将全部对话历史重复 N 遍后发给 API，N 越大每次 prompt 越长（默认：10；仅 -s 模式下生效）'
+        help='【无限重复模式】每批次运行的对话轮次上限，跑满后自动清空对话历史并重新开始（默认：10；仅 -s 模式下生效）'
+    )
+    parser.add_argument(
+        '--repeat', '-rp',
+        type=int,
+        default=3,
+        help='【无限重复模式】每轮将全部对话历史重复 N 遍后发给 API，N 越大每次 prompt 越长（默认：3；仅 -s 模式下生效）'
     )
 
     # 通用参数
@@ -723,6 +780,7 @@ async def main():
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             rounds=args.rounds,
+            repeat_count=args.repeat,
             enable_thinking=not args.no_thinking,
             concurrency=args.concurrency,
         )
