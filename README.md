@@ -9,7 +9,7 @@
   1. 图片批量等比例缩小
   2. 将chatvveai的导出格式转为Open WebUI的导入格式
   3. excel多文件拆分合并
-  4. 扫描文件树
+  4. 扫描文件树，可扫描everything支持的格式或自有格式。
   5. jp2转png
   6. Firefox书签转Tree，使用方法见：`https://github.com/100pangci/My-Firefox-Bookmark-Tree`
   7. 打印机压力测试脚本，可以定期发送打印任务，以测试打印机，PDF打印效果不佳，需搭配SumatraPDF使用。
